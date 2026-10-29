@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-JWT Generator API - @DGDRIFT 
+JWT Generator API - @DGDRIFT
   /health
+  /token        (GET + POST)
+  /access-to-jwt (GET)
+  /debug        (GET + POST) - للتشخيص فقط
 """
 import os
 import re
@@ -322,11 +325,11 @@ def build_game_data(token_data):
 
 # ==================== RESPONSE BUILDER ====================
 def build_response(success, uid, region=None, token=None, account_id=None,
-                   nickname=None, status_code=200):
+                   nickname=None, status_code=200, error=None):
     region_code = normalize_region(region) if region else None
     login_url = region_to_url(region_code) if region_code else "N/A"
 
-    return {
+    resp = {
         "Success": bool(success),
         "Nickname": nickname or "",
         "Account_uid": str(account_id) if account_id else str(uid),
@@ -343,6 +346,9 @@ def build_response(success, uid, region=None, token=None, account_id=None,
         "Telegram": TELEGRAM,
         "Status_Code": status_code,
     }
+    if error:
+        resp["Error"] = error
+    return resp
 
 # ==================== CORE: MAJOR LOGIN ====================
 def _do_major_login(access_token, open_id):
@@ -371,21 +377,65 @@ def _do_major_login(access_token, open_id):
                              headers=headers, verify=False, timeout=15)
     return response
 
-# ==================== ROUTE: /token ====================
-@app.route('/token', methods=['GET'])
-def get_single_response():
+# ==================== HELPER: EXTRACT CREDENTIALS ====================
+def _extract_credentials():
+    """
+    يستخرج uid و password من GET (query) أو POST (JSON أو Form).
+    يعيد (uid, password, source) حيث source = 'GET' | 'JSON' | 'FORM' | None
+    """
+    uid = None
+    password = None
+    source = None
+
+    # 1. Query string (GET أو POST مع query)
     uid = request.args.get('uid')
     password = request.args.get('password')
+    if uid and password:
+        source = 'GET'
+        return uid, password, source
+
+    # 2. JSON body
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        uid = data.get('uid') or uid
+        password = data.get('password') or password
+        if uid and password:
+            source = 'JSON'
+            return uid, password, source
+
+    # 3. Form body
+    if request.form:
+        uid = request.form.get('uid') or uid
+        password = request.form.get('password') or password
+        if uid and password:
+            source = 'FORM'
+            return uid, password, source
+
+    return uid, password, source
+
+# ==================== ROUTE: /token ====================
+@app.route('/token', methods=['GET', 'POST'])
+def get_single_response():
+    uid, password, source = _extract_credentials()
+
+    log.info(
+        f"[TOKEN] method={request.method} source={source} "
+        f"uid={uid!r} password={'SET' if password else 'MISSING'}"
+    )
 
     if not uid or not password:
         return jsonify(build_response(
-            success=False, uid=uid or "N/A", status_code=400
+            success=False,
+            uid=uid or "N/A",
+            status_code=400,
+            error="Missing uid or password. Use GET query or POST JSON: {\"uid\":\"...\",\"password\":\"...\"}"
         )), 400
 
     token_data = get_token(password, uid)
     if not token_data:
         return jsonify(build_response(
-            success=False, uid=uid, status_code=401
+            success=False, uid=uid, status_code=401,
+            error="OAuth failed: invalid uid/password or Garena unreachable"
         )), 401
 
     try:
@@ -397,7 +447,8 @@ def get_single_response():
         if response.status_code != 200:
             return jsonify(build_response(
                 success=False, uid=uid,
-                status_code=response.status_code
+                status_code=response.status_code,
+                error=f"MajorLogin HTTP {response.status_code}"
             )), response.status_code
 
         parsed = parse_garena_response(response.content)
@@ -409,20 +460,23 @@ def get_single_response():
             token=parsed["token"],
             account_id=parsed["account_id"],
             nickname=parsed.get("nickname"),
-            status_code=200 if parsed["token"] else 500
+            status_code=200 if parsed["token"] else 500,
+            error=None if parsed["token"] else "JWT extraction failed"
         )), 200 if parsed["token"] else 500
 
     except Exception as e:
         log.error(f"Internal error:\n{traceback.format_exc()}")
         return jsonify(build_response(
-            success=False, uid=uid, status_code=500
+            success=False, uid=uid, status_code=500,
+            error=f"Internal error: {type(e).__name__}"
         )), 500
 
 # ==================== CORE: ACCESS TO JWT ====================
 def _access_to_jwt_handler(access_token, open_id=None):
     if not access_token:
         return jsonify(build_response(
-            success=False, uid="N/A", status_code=400
+            success=False, uid="N/A", status_code=400,
+            error="Missing access_token"
         )), 400
 
     # Try auto-extract if JWT
@@ -440,7 +494,8 @@ def _access_to_jwt_handler(access_token, open_id=None):
         if response.status_code != 200:
             return jsonify(build_response(
                 success=False, uid=open_id or "N/A",
-                status_code=response.status_code
+                status_code=response.status_code,
+                error=f"MajorLogin HTTP {response.status_code}"
             )), response.status_code
 
         parsed = parse_garena_response(response.content)
@@ -452,7 +507,8 @@ def _access_to_jwt_handler(access_token, open_id=None):
             token=parsed["token"],
             account_id=parsed["account_id"],
             nickname=parsed.get("nickname"),
-            status_code=200 if parsed["token"] else 500
+            status_code=200 if parsed["token"] else 500,
+            error=None if parsed["token"] else "JWT extraction failed"
         )
 
         if parsed["token"]:
@@ -463,7 +519,8 @@ def _access_to_jwt_handler(access_token, open_id=None):
     except Exception as e:
         log.error(f"Internal error:\n{traceback.format_exc()}")
         return jsonify(build_response(
-            success=False, uid=open_id or "N/A", status_code=500
+            success=False, uid=open_id or "N/A", status_code=500,
+            error=f"Internal error: {type(e).__name__}"
         )), 500
 
 # ==================== ROUTE: /access-to-jwt=XXX ====================
@@ -473,13 +530,34 @@ def access_to_jwt_path(access_token):
     return _access_to_jwt_handler(access_token, open_id)
 
 # ==================== ROUTE: /access-to-jwt?token=XXX ====================
-@app.route('/access-to-jwt', methods=['GET'])
+@app.route('/access-to-jwt', methods=['GET', 'POST'])
 def access_to_jwt_query():
-    access_token = (request.args.get('token')
-                    or request.args.get('access_token')
-                    or request.args.get('access'))
-    open_id = request.args.get('open_id')
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or request.form or {}
+        access_token = data.get('token') or data.get('access_token') or data.get('access')
+        open_id = data.get('open_id')
+    else:
+        access_token = (request.args.get('token')
+                        or request.args.get('access_token')
+                        or request.args.get('access'))
+        open_id = request.args.get('open_id')
     return _access_to_jwt_handler(access_token, open_id)
+
+# ==================== DEBUG (DIAGNOSTIC) ====================
+@app.route('/debug', methods=['GET', 'POST'])
+def debug():
+    """مسار تشخيصي — يُظهر ما استقبله Flask فعلياً. احذفه بعد الانتهاء."""
+    return jsonify({
+        "method": request.method,
+        "args": dict(request.args),
+        "form": dict(request.form),
+        "json": request.get_json(silent=True),
+        "raw_query": request.query_string.decode('utf-8', errors='replace'),
+        "url": request.url,
+        "full_path": request.full_path,
+        "headers": {k: v for k, v in request.headers.items()
+                    if k.lower() in ('content-type', 'user-agent', 'host')},
+    })
 
 # ==================== HEALTH ====================
 @app.route('/health', methods=['GET'])
