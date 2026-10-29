@@ -14,7 +14,7 @@
       "src": "/(.*)",
       "dest": "app.py",
       "headers": {
-        "X-API-Region": "India"
+        "X-API-Region": "mena"
       }
     }
   ],
